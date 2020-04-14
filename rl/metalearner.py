@@ -55,7 +55,7 @@ class MetaLearner(object):
 
         return loss
 
-    def adapt(self, episodes, first_order=False, params=None, lr=None):
+    def adapt(self, episodes, context=None, first_order=False, params=None, lr=None):
         """Adapt the parameters of the policy network to a new task, from 
         sampled trajectories `episodes`, with a one-step gradient update [1].
         """
@@ -63,35 +63,54 @@ class MetaLearner(object):
         if lr is None:
             lr = self.fast_lr
 
+        kl_loss = self.policy.encoder_loss(context)
+
         # Fit the baseline to the training episodes
         self.baseline.fit(episodes)
 
         # Get the loss on the training episodes
-        loss = self.inner_loss(episodes, params=params)
+        reinforce_loss = self.inner_loss(episodes, params=params)
+
+        # loss = reinforce_loss + kl_loss
+        loss = kl_loss + reinforce_loss
 
         # Get the new parameters after a one-step gradient update
         params = self.policy.update_params(loss, step_size=lr, first_order=first_order, params=params)
 
-        return params, loss
+        return params, (loss.item(), kl_loss.item(), reinforce_loss.item())
 
     def sample(self, tasks, first_order=False):
         """Sample trajectories (before and after the update of the parameters) 
         for all the tasks `tasks`.
         """
+
         episodes = []
+        context = []
+        z_train = []
         losses = []
         for task in tasks:
+
             self.sampler.reset_task(task)
             self.policy.reset_context()
+
             train_episodes = self.sampler.sample(self.policy, gamma=self.gamma)
+            context_task = self.policy.get_context()
+
             # inner loop (for CAVIA, this only updates the context parameters)
-            params, loss = self.adapt(train_episodes, first_order=first_order)
+            params, loss = self.adapt(train_episodes, context_task, first_order=first_order)
+
             # rollouts after inner loop update
             valid_episodes = self.sampler.sample(self.policy, params=params, gamma=self.gamma)
-            episodes.append((train_episodes, valid_episodes))
-            losses.append(loss.item())
 
-        return episodes, losses
+            context_task = self.policy.get_context()
+            z_means, z_vars = self.policy.get_z()
+
+            episodes.append((train_episodes, valid_episodes))
+            losses.append(loss)
+            context.append(context_task)
+            z_train.append([z_means, z_vars])
+
+        return episodes, context, z_train, losses
 
     def test(self, tasks, num_steps, batch_size, halve_lr):
         """Sample trajectories (before and after the update of the parameters)
@@ -114,7 +133,6 @@ class MetaLearner(object):
             curr_episodes = [test_episodes]
 
             for i in range(1, num_steps + 1):
-
                 # lower learning rate after first update (for MAML, as described in their paper)
                 if i == 1 and halve_lr:
                     lr = self.fast_lr / 2
@@ -122,10 +140,18 @@ class MetaLearner(object):
                     lr = self.fast_lr
 
                 # inner-loop update
-                params, loss = self.adapt(test_episodes, first_order=True, params=params, lr=lr)
+                contex_task = self.policy.get_context()
+                params, _ = self.adapt(test_episodes, 
+                                       contex_task, 
+                                       first_order = True, 
+                                       params = params, 
+                                       lr = lr)
 
                 # get new rollouts
-                test_episodes = self.sampler.sample(self.policy, gamma=self.gamma, params=params, batch_size=batch_size)
+                test_episodes = self.sampler.sample(self.policy, 
+                                                    gamma = self.gamma, 
+                                                    params = params, 
+                                                    batch_size = batch_size)
                 curr_episodes.append(test_episodes)
 
             episodes_per_task.append(curr_episodes)
@@ -133,16 +159,16 @@ class MetaLearner(object):
         self.policy.reset_context()
         return episodes_per_task
 
-    def kl_divergence(self, episodes, old_pis=None):
+    def kl_divergence(self, episodes, context, old_pis=None):
         kls = []
         if old_pis is None:
             old_pis = [None] * len(episodes)
 
-        for (train_episodes, valid_episodes), old_pi in zip(episodes, old_pis):
+        for (train_episodes, valid_episodes), context_task, old_pi in zip(episodes, context, old_pis):
 
             # this is the inner-loop update
             self.policy.reset_context()
-            params, _ = self.adapt(train_episodes)
+            params, _ = self.adapt(train_episodes, context_task)
             pi = self.policy(valid_episodes.observations, params=params)
 
             if old_pi is None:
@@ -156,11 +182,11 @@ class MetaLearner(object):
 
         return torch.mean(torch.stack(kls, dim=0))
 
-    def hessian_vector_product(self, episodes, damping=1e-2):
+    def hessian_vector_product(self, episodes, context, damping=1e-2):
         """Hessian-vector product, based on the Perlmutter method."""
 
         def _product(vector):
-            kl = self.kl_divergence(episodes)
+            kl = self.kl_divergence(episodes, context)
             grads = torch.autograd.grad(kl, self.policy.parameters(), create_graph=True)
             flat_grad_kl = parameters_to_vector(grads)
 
@@ -172,16 +198,16 @@ class MetaLearner(object):
 
         return _product
 
-    def surrogate_loss(self, episodes, old_pis=None):
+    def surrogate_loss(self, episodes, context, old_pis=None):
         losses, kls, pis = [], [], []
         if old_pis is None:
             old_pis = [None] * len(episodes)
 
-        for (train_episodes, valid_episodes), old_pi in zip(episodes, old_pis):
+        for (train_episodes, valid_episodes), context_task, old_pi in zip(episodes, context, old_pis):
 
             # do inner-loop update
             self.policy.reset_context()
-            params, _ = self.adapt(train_episodes)
+            params, _ = self.adapt(train_episodes, context_task)
 
             with torch.set_grad_enabled(old_pi is None):
 
@@ -213,18 +239,19 @@ class MetaLearner(object):
 
         return torch.mean(torch.stack(losses, dim=0)), torch.mean(torch.stack(kls, dim=0)), pis
 
-    def step(self, episodes, max_kl=1e-3, cg_iters=10, cg_damping=1e-2,
+    def step(self, episodes, context, max_kl=1e-3, cg_iters=10, cg_damping=1e-2,
              ls_max_steps=10, ls_backtrack_ratio=0.5):
         """Meta-optimization step (ie. update of the initial parameters), based 
         on Trust Region Policy Optimization (TRPO, [4]).
         """
-        old_loss, _, old_pis = self.surrogate_loss(episodes)
+
+        old_loss, _, old_pis = self.surrogate_loss(episodes, context)
         # this part will take higher order gradients through the inner loop:
         grads = torch.autograd.grad(old_loss, self.policy.parameters())
         grads = parameters_to_vector(grads)
 
         # Compute the step direction with Conjugate Gradient
-        hessian_vector_product = self.hessian_vector_product(episodes, damping=cg_damping)
+        hessian_vector_product = self.hessian_vector_product(episodes, context, damping=cg_damping)
         stepdir = conjugate_gradient(hessian_vector_product, grads, cg_iters=cg_iters)
 
         # Compute the Lagrange multiplier
@@ -240,13 +267,14 @@ class MetaLearner(object):
         step_size = 1.0
         for _ in range(ls_max_steps):
             vector_to_parameters(old_params - step_size * step, self.policy.parameters())
-            loss, kl, _ = self.surrogate_loss(episodes, old_pis=old_pis)
+            loss, kl, _ = self.surrogate_loss(episodes, context, old_pis=old_pis)
             improve = loss - old_loss
             if (improve.item() < 0.0) and (kl.item() < max_kl):
                 break
             step_size *= ls_backtrack_ratio
         else:
-            print('no update?')
+            print('No update?')
+            print('Improve = ' + str(improve.item()) + ' | KL = ' + str(kl.item()))
             vector_to_parameters(old_params, self.policy.parameters())
 
         return loss

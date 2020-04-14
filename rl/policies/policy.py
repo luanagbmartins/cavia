@@ -23,17 +23,11 @@ class Policy(nn.Module):
         """
 
         if params is None:
-            params = [param for name, param in self.named_parameters()]
-        else:
-            params = [param for name, param in params.items()]
+            params = self.parameters()
 
         grads = torch.autograd.grad(loss, params, create_graph=not first_order)
-        updated_params = OrderedDict()
-
-        for (name, param), param, grad in zip(self.named_parameters(), params, grads):
-            updated_params[name] = param - step_size * grad
-
-        return updated_params
+        for param, grad in zip(params, grads):
+            param = param - step_size * grad
 
     def reset_context(self):
         pass

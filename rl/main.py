@@ -14,7 +14,8 @@ from arguments import parse_args
 from baseline import LinearFeatureBaseline
 from metalearner import MetaLearner
 from policies.categorical_mlp import CategoricalMLPPolicy
-from policies.normal_mlp import NormalMLPPolicy, CaviaMLPPolicy
+from policies.normal_mlp import NormalMLPPolicy
+from policies.context import ContextEncoder
 from sampler import BatchSampler
 
 
@@ -42,29 +43,35 @@ def get_returns(episodes_per_task):
 def total_rewards(episodes_per_task, interval=False):
 
     returns = get_returns(episodes_per_task).cpu().numpy()
-
     mean = np.mean(returns, axis=0)
+    
+    # Endpoints of the range that contains alpha percent of the distribution
+    # interval(alpha, df, loc=0, scale=1)
     conf_int = st.t.interval(0.95, len(mean) - 1, loc=mean, scale=st.sem(returns, axis=0))
-    conf_int = mean - conf_int
+    conf_int = [mean + critval * st.sem(returns, axis=0) / np.sqrt(len(returns)) for critval in conf_int]
     if interval:
-        return mean, conf_int[0]
+        return mean, conf_int
     else:
         return mean
 
 
-def main(args):
-    print('starting....')
 
+def main(args):
+
+    print('starting....')
     utils.set_seed(args.seed, cudnn=args.make_deterministic)
 
-    continuous_actions = (args.env_name in ['AntVel-v1', 'AntDir-v1',
-                                            'AntPos-v0', 'HalfCheetahVel-v1', 'HalfCheetahDir-v1',
+    continuous_actions = (args.env_name in ['AntVel-v1', 
+                                            'AntDir-v1',
+                                            'AntPos-v0', 
+                                            'HalfCheetahVel-v1', 
+                                            'HalfCheetahDir-v1',
                                             '2DNavigation-v0'])
 
     # subfolders for logging
-    method_used = 'maml' if args.maml else 'cavia'
+    method_used = 'experiment'
     num_context_params = str(args.num_context_params) + '_' if not args.maml else ''
-    output_name = num_context_params + 'lr=' + str(args.fast_lr) + 'tau=' + str(args.tau)
+    output_name = num_context_params + 'lr=' + str(args.fast_lr) + 'kl-lambda=' + str(args.kl_lambda) + 'tau=' + str(args.tau)
     output_name += '_' + datetime.datetime.now().strftime('%d_%m_%Y_%H_%M_%S')
     dir_path = os.path.dirname(os.path.realpath(__file__))
     log_folder = os.path.join(os.path.join(dir_path, 'logs'), args.env_name, method_used, output_name)
@@ -87,38 +94,46 @@ def main(args):
         config.update(device=args.device.type)
         json.dump(config, f, indent=2)
 
-    sampler = BatchSampler(args.env_name, batch_size=args.fast_batch_size, num_workers=args.num_workers,
-                           device=args.device, seed=args.seed)
+    sampler = BatchSampler(args.env_name, 
+                           batch_size = args.fast_batch_size, 
+                           num_workers = args.num_workers,
+                           device = args.device, seed=args.seed)
+
+    obs_dim = int(np.prod(sampler.envs.observation_space.shape))
+    action_dim = int(np.prod(sampler.envs.action_space.shape))
+    reward_dim = 1
+    latent_dim = args.num_context_params
+    context_encoder_input_dim = obs_dim + action_dim + reward_dim
+    context_encoder_output_dim = latent_dim * 2 
 
     if continuous_actions:
-        if not args.maml:
-            policy = CaviaMLPPolicy(
-                int(np.prod(sampler.envs.observation_space.shape)),
-                int(np.prod(sampler.envs.action_space.shape)),
-                hidden_sizes=(args.hidden_size,) * args.num_layers,
-                num_context_params=args.num_context_params,
-                device=args.device
-            )
-        else:
-            policy = NormalMLPPolicy(
-                int(np.prod(sampler.envs.observation_space.shape)),
-                int(np.prod(sampler.envs.action_space.shape)),
-                hidden_sizes=(args.hidden_size,) * args.num_layers
-            )
-    else:
-        if not args.maml:
-            raise NotImplementedError
-        else:
-            policy = CategoricalMLPPolicy(
-                int(np.prod(sampler.envs.observation_space.shape)),
-                sampler.envs.action_space.n,
-                hidden_sizes=(args.hidden_size,) * args.num_layers)
+        encoder = ContextEncoder(
+            context_encoder_input_dim,
+            context_encoder_output_dim,
+            latent_dim,
+            hidden_sizes=(args.hidden_size,) * args.num_layers,
+            kl_lambda=args.kl_lambda,
+            device=args.device
+        )
+        policy = NormalMLPPolicy(
+            obs_dim,
+            action_dim,
+            hidden_sizes=(args.hidden_size,) * args.num_layers,
+            num_context_params=args.num_context_params,
+            device=args.device,
+            encoder=encoder
+        )
 
     # initialise baseline
     baseline = LinearFeatureBaseline(int(np.prod(sampler.envs.observation_space.shape)))
 
     # initialise meta-learner
-    metalearner = MetaLearner(sampler, policy, baseline, gamma=args.gamma, fast_lr=args.fast_lr, tau=args.tau,
+    metalearner = MetaLearner(sampler, 
+                              policy,
+                              baseline, 
+                              gamma=args.gamma, 
+                              fast_lr=args.fast_lr, 
+                              tau=args.tau,
                               device=args.device)
 
     for batch in range(args.num_batches):
@@ -128,30 +143,33 @@ def main(args):
 
         # do the inner-loop update for each task
         # this returns training (before update) and validation (after update) episodes
-        episodes, inner_losses = metalearner.sample(tasks, first_order=args.first_order)
+        episodes, context, z_train, inner_losses = metalearner.sample(tasks, first_order=args.first_order)
 
         # take the meta-gradient step
-        outer_loss = metalearner.step(episodes, max_kl=args.max_kl, cg_iters=args.cg_iters,
+        outer_loss = metalearner.step(episodes, context, max_kl=args.max_kl, cg_iters=args.cg_iters,
                                       cg_damping=args.cg_damping, ls_max_steps=args.ls_max_steps,
                                       ls_backtrack_ratio=args.ls_backtrack_ratio)
 
         # -- logging
 
-        curr_returns = total_rewards(episodes, interval=True)
-        print('   return after update: ', curr_returns[0][1])
+        curr_returns = total_rewards(episodes, interval=False)
+        print('   return after update: ', curr_returns[1])
 
         # Tensorboard
         writer.add_scalar('policy/actions_train', episodes[0][0].actions.mean(), batch)
         writer.add_scalar('policy/actions_test', episodes[0][1].actions.mean(), batch)
 
-        writer.add_scalar('running_returns/before_update', curr_returns[0][0], batch)
-        writer.add_scalar('running_returns/after_update', curr_returns[0][1], batch)
+        writer.add_scalar('running_returns/before_update', curr_returns[0], batch)
+        writer.add_scalar('running_returns/after_update', curr_returns[1], batch)
 
-        writer.add_scalar('running_cfis/before_update', curr_returns[1][0], batch)
-        writer.add_scalar('running_cfis/after_update', curr_returns[1][1], batch)
-
-        writer.add_scalar('loss/inner_rl', np.mean(inner_losses), batch)
+        writer.add_scalar('loss/inner_rl', np.mean(inner_losses[0]), batch)
+        writer.add_scalar('loss/kl_loss', np.mean(inner_losses[1]), batch)
+        writer.add_scalar('loss/reinforce_loss', np.mean(inner_losses[2]), batch)
         writer.add_scalar('loss/outer_rl', outer_loss.item(), batch)
+
+        # Inference
+        writer.add_scalar('posterior/z_means', np.mean(z_train, axis=0)[0], batch)
+        writer.add_scalar('posterior/z_vars', np.mean(z_train, axis=0)[1], batch)
 
         # -- evaluation
 
@@ -160,10 +178,9 @@ def main(args):
             test_tasks = sampler.sample_tasks(num_tasks=args.meta_batch_size)
             test_episodes = metalearner.test(test_tasks, num_steps=args.num_test_steps,
                                              batch_size=args.test_batch_size, halve_lr=args.halve_test_lr)
-            all_returns = total_rewards(test_episodes, interval=True)
+            all_returns = total_rewards(test_episodes, interval=False)
             for num in range(args.num_test_steps + 1):
-                writer.add_scalar('evaluation_rew/avg_rew ' + str(num), all_returns[0][num], batch)
-                writer.add_scalar('evaluation_cfi/avg_rew ' + str(num), all_returns[1][num], batch)
+                writer.add_scalar('evaluation_rew/avg_rew ' + str(num), all_returns[num], batch)
 
             print('   inner RL loss:', np.mean(inner_losses))
             print('   outer RL loss:', outer_loss.item())
@@ -171,6 +188,9 @@ def main(args):
         # -- save policy network
         with open(os.path.join(save_folder, 'policy-{0}.pt'.format(batch)), 'wb') as f:
             torch.save(policy.state_dict(), f)
+        with open(os.path.join(save_folder, 'context-{0}.pt'.format(batch)), 'wb') as f:
+            torch.save(encoder.state_dict(), f)
+
 
 
 if __name__ == '__main__':
