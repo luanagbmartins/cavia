@@ -27,26 +27,35 @@ class BatchSampler(object):
         self._env = gym.make(env_name)
         self._env.seed(seed)
 
-    def sample(self, policy, params=None, gamma=0.95, batch_size=None):
+    def sample(self, agent, gamma=0.95, batch_size=None):
         if batch_size is None:
             batch_size = self.batch_size
+
         episodes = BatchEpisodes(batch_size=batch_size, gamma=gamma, device=self.device)
+
         for i in range(batch_size):
             self.queue.put(i)
         for _ in range(self.num_workers):
             self.queue.put(None)
+            
         observations, batch_ids = self.envs.reset()
         dones = [False]
         while (not all(dones)) or (not self.queue.empty()):
+
             with torch.no_grad():
                 observations_tensor = torch.from_numpy(observations).to(device=self.device)
-                actions_tensor = policy(observations_tensor, params=params).sample()
+                actions_tensor = agent.policy(observations_tensor).sample()
                 actions = actions_tensor.cpu().numpy()
+
             new_observations, rewards, dones, new_batch_ids, _ = self.envs.step(actions)
             episodes.append(observations, actions, rewards, batch_ids)
-            policy.encoder.update_context((observations, actions, rewards))
+            agent.update_context((observations, actions, rewards, new_observations))
             observations, batch_ids = new_observations, new_batch_ids
-        return episodes
+
+            if all(dones):
+                agent.sample_z()
+
+        return episodes, agent.get_context()
 
     def reset_task(self, task):
         tasks = [task for _ in range(self.num_workers)]

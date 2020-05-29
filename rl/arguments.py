@@ -11,7 +11,6 @@ def parse_args():
 
     # General
     parser.add_argument('--env-name', type=str,
-                        # default='HalfCheetahDir-v1',
                         default='2DNavigation-v0',
                         help='name of the environment')
     parser.add_argument('--gamma', type=float, default=0.95,
@@ -20,18 +19,27 @@ def parse_args():
                         help='value of the discount factor for GAE')
     parser.add_argument('--first-order', action='store_true',
                         help='use the first-order approximation of MAML/CAVIA')
-    parser.add_argument('--num-context-params', type=int, default=5,
+    parser.add_argument('--num-context-params', type=int, default=2,
                         help='number of context parameters')
+
+    # Encoder arguments
     parser.add_argument('--kl-lambda', type=float, default=0.01,
                         help='kl-lambda for the context encoder')
+    parser.add_argument('--use-information-bottleneck',  action='store_true', default=False,
+                        help='false makes latent context deterministic')
+    parser.add_argument('--use-next-obs-in-context',  action='store_true', default=False,
+                        help='use next obs if it is useful in distinguishing tasks')
 
-    # Run MAML instead of CAVIA
-    parser.add_argument('--maml', action='store_true', default=False,
-                        help='turn on MAML')
     # Policy network (relu activation function)
     parser.add_argument('--hidden-size', type=int, default=100,
                         help='number of hidden units per layer')
     parser.add_argument('--num-layers', type=int, default=2,
+                        help='number of hidden layers')
+
+    # Context network (relu activation function)
+    parser.add_argument('--context-hidden-size', type=int, default=100,
+                        help='number of hidden units per layer')
+    parser.add_argument('--context-num-layers', type=int, default=1,
                         help='number of hidden layers')
 
     # Testing
@@ -70,7 +78,7 @@ def parse_args():
     parser.add_argument('--num-workers', type=int, default=mp.cpu_count() - 1,
                         help='number of workers for trajectories sampling')
     parser.add_argument('--seed', type=int, default=42, help='seed')
-    parser.add_argument('--make_deterministic', action='store_true',
+    parser.add_argument('--make-deterministic', action='store_true',
                         help='make everything deterministic (set cudnn seed; num_workers=1; '
                              'will slow things down but make them reproducible!)')
 
@@ -82,11 +90,7 @@ def parse_args():
     # use the GPU if available
     args.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    args.output_folder = 'maml' if args.maml else 'cavia'
-
-    if args.maml and not args.halve_test_lr:
-        warnings.warn('You are using MAML and not halving the LR at test time!')
-
+    args.output_folder = 'cavia'
     # Create logs and saves folder if they don't exist
     if not os.path.exists('./logs'):
         os.makedirs('./logs')

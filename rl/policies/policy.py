@@ -2,6 +2,8 @@ from collections import OrderedDict
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.convert_parameters import (vector_to_parameters,
+                                               parameters_to_vector)
 
 
 def weight_init(module):
@@ -22,12 +24,10 @@ class Policy(nn.Module):
         network.
         """
 
-        if params is None:
-            params = self.parameters()
-
         grads = torch.autograd.grad(loss, params, create_graph=not first_order)
-        for param, grad in zip(params, grads):
-            param = param - step_size * grad
+        grads = parameters_to_vector(grads)
+        old_params = parameters_to_vector(self.parameters())
+        vector_to_parameters(old_params - step_size * grads, self.parameters())
 
     def reset_context(self):
         pass

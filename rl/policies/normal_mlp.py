@@ -16,12 +16,11 @@ class NormalMLPPolicy(Policy, nn.Module):
     `HalfCheetahDir`).
     """
 
-    def __init__(self, input_size, output_size, device, hidden_sizes=(), num_context_params=10,
-                 nonlinearity=F.relu, init_std=1.0, min_std=1e-6, encoder=None):
+    def __init__( self, input_size, output_size, device, hidden_sizes=(), 
+                  num_context_params=10, nonlinearity=F.relu, init_std=1.0, min_std=1e-6 ):
         super(NormalMLPPolicy, self).__init__(input_size, output_size)
         self.input_size = input_size
         self.output_size = output_size
-        self.device = device
 
         self.hidden_sizes = hidden_sizes
         self.nonlinearity = nonlinearity
@@ -34,22 +33,18 @@ class NormalMLPPolicy(Policy, nn.Module):
         for i in range(2, self.num_layers):
             self.add_module('layer{0}'.format(i), nn.Linear(layer_sizes[i - 1], layer_sizes[i]))
 
-        self.encoder = encoder
-        self.encoder.to(device)
         self.num_context_params = num_context_params
-        self.context_params = self.encoder.clear_z()
+        self.context_params = torch.zeros(self.num_context_params, requires_grad=True).to(device)
 
         self.mu = nn.Linear(layer_sizes[-1], output_size)
         self.sigma = nn.Parameter(torch.Tensor(output_size))
         self.sigma.data.fill_(math.log(init_std))
         self.apply(weight_init)
 
-    def forward(self, input, params=None):
+    def forward(self, input):
 
-        # if no parameters are given, use the standard ones
-        if params is None:
-            params = OrderedDict(self.named_parameters())
-
+        params = OrderedDict(self.named_parameters())
+        
         # concatenate context parameters to input
         output = torch.cat((input, self.context_params.expand(input.shape[:-1] + self.context_params.shape)),
                            dim=len(input.shape) - 1)
@@ -65,32 +60,3 @@ class NormalMLPPolicy(Policy, nn.Module):
         scale = torch.exp(torch.clamp(params['sigma'], min=self.min_log_std))
 
         return Normal(loc=mu, scale=scale)
-
-    def update_params(self, loss, step_size, first_order=False, params=None):
-        """Apply one step of gradient descent on the loss function `loss`, with
-        step-size `step_size`, and returns the updated parameters of the neural
-        network.
-        """
-        policy_params = OrderedDict(self.named_parameters())
-        self.encoder.update_params(loss, step_size, first_order)
-
-        return policy_params
-
-    def reset_context(self):
-        self.context_params = self.encoder.clear_z()
-
-    def encoder_loss(self, context=None):
-        Z = self.encoder(context)
-        self.context_params = Z
-
-        kl_div = self.encoder.compute_kl_div()
-        loss = kl_div * self.encoder.kl_lambda
-        return loss
-
-    def get_context(self):
-        return self.encoder.context
-
-    def get_z(self):
-        z_means = self.encoder.z_means.data.cpu().numpy().mean()
-        z_vars = self.encoder.z_vars.data.cpu().numpy().mean()
-        return (z_means, z_vars)
